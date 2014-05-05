@@ -11,12 +11,13 @@
 # http://pygments.org/
 # It's separated from the rest of pygments to increase performance
 # and to allow some customizations.
-from __future__ import absolute_import
-from __future__ import unicode_literals
-import re
 
-from . import tokens
-from .keywords import KEYWORDS, KEYWORDS_COMMON
+import re
+import sys
+
+from sqlparse import tokens
+from sqlparse.keywords import KEYWORDS, KEYWORDS_COMMON
+from cStringIO import StringIO
 
 
 class include(str):
@@ -80,7 +81,7 @@ class LexerMeta(type):
 
             try:
                 rex = re.compile(tdef[0], rflags).match
-            except Exception as err:
+            except Exception, err:
                 raise ValueError(("uncompilable regex %r in state"
                                   " %r of %r: %s"
                                   % (tdef[0], state, cls, err)))
@@ -151,13 +152,15 @@ class LexerMeta(type):
         return type.__call__(cls, *args, **kwds)
 
 
-class Lexer(object, metaclass=LexerMeta):
+class Lexer(object):
+
+    __metaclass__ = LexerMeta
 
     encoding = 'utf-8'
     stripall = False
     stripnl = False
     tabsize = 0
-    flags = re.IGNORECASE
+    flags = re.IGNORECASE | re.UNICODE
 
     tokens = {
         'root': [
@@ -165,7 +168,7 @@ class Lexer(object, metaclass=LexerMeta):
             # $ matches *before* newline, therefore we have two patterns
             # to match Comment.Single
             (r'--.*?$', tokens.Comment.Single),
-            (r'(\r|\n|\r\n)', tokens.Newline),
+            (r'(\r\n|\r|\n)', tokens.Newline),
             (r'\s+', tokens.Whitespace),
             (r'/\*', tokens.Comment.Multiline, 'multiline-comments'),
             (r':=', tokens.Assignment),
@@ -174,44 +177,70 @@ class Lexer(object, metaclass=LexerMeta):
             (r'CASE\b', tokens.Keyword),  # extended CASE(foo)
             (r"`(``|[^`])*`", tokens.Name),
             (r"´(´´|[^´])*´", tokens.Name),
-            (r'\$([a-zA-Z_][a-zA-Z0-9_]*)?\$', tokens.Name.Builtin),
+            (r'\$([^\W\d]\w*)?\$', tokens.Name.Builtin),
             (r'\?{1}', tokens.Name.Placeholder),
-            (r'[$:?%][a-zA-Z0-9_]+[^$:?%]?', tokens.Name.Placeholder),
-            (r'@[a-zA-Z_][a-zA-Z0-9_]+', tokens.Name),
-            (r'[a-zA-Z_][a-zA-Z0-9_]*(?=[.(])', tokens.Name),  # see issue39
-            (r'[<>=~!]+', tokens.Operator.Comparison),
-            (r'[+/@#%^&|`?^-]+', tokens.Operator),
-            (r'0x[0-9a-fA-F]+', tokens.Number.Hexadecimal),
-            (r'[0-9]*\.[0-9]+', tokens.Number.Float),
-            (r'[0-9]+', tokens.Number.Integer),
+            (r'%\(\w+\)s', tokens.Name.Placeholder),
+            (r'[$:?%]\w+', tokens.Name.Placeholder),
+            # FIXME(andi): VALUES shouldn't be listed here
+            # see https://github.com/andialbrecht/sqlparse/pull/64
+            (r'VALUES', tokens.Keyword),
+            (r'@[^\W\d_]\w+', tokens.Name),
+            (r'[^\W\d_]\w*(?=[.(])', tokens.Name),  # see issue39
+            (r'[-]?0x[0-9a-fA-F]+', tokens.Number.Hexadecimal),
+            (r'[-]?[0-9]*(\.[0-9]+)?[eE][-]?[0-9]+', tokens.Number.Float),
+            (r'[-]?[0-9]*\.[0-9]+', tokens.Number.Float),
+            (r'[-]?[0-9]+', tokens.Number.Integer),
             # TODO: Backslash escapes?
-            (r"(''|'.*?[^\\]')", tokens.String.Single),
+            (r"'(''|\\'|[^'])*'", tokens.String.Single),
             # not a real string literal in ANSI SQL:
             (r'(""|".*?[^\\]")', tokens.String.Symbol),
             (r'(\[.*[^\]]\])', tokens.Name),
-            (r'(LEFT |RIGHT )?(INNER |OUTER )?JOIN\b', tokens.Keyword),
-            (r'END( IF| LOOP)?\b', tokens.Keyword),
+            (r'((LEFT\s+|RIGHT\s+|FULL\s+)?(INNER\s+|OUTER\s+|STRAIGHT\s+)?|(CROSS\s+|NATURAL\s+)?)?JOIN\b', tokens.Keyword),
+            (r'END(\s+IF|\s+LOOP)?\b', tokens.Keyword),
             (r'NOT NULL\b', tokens.Keyword),
-            (r'CREATE( OR REPLACE)?\b', tokens.Keyword.DDL),
-            (r'(?<=\.)[a-zA-Z_][a-zA-Z0-9_]*', tokens.Name),
-            (r'[a-zA-Z_][a-zA-Z0-9_]*', is_keyword),
+            (r'CREATE(\s+OR\s+REPLACE)?\b', tokens.Keyword.DDL),
+            (r'(?<=\.)[^\W\d_]\w*', tokens.Name),
+            (r'[^\W\d_]\w*', is_keyword),
             (r'[;:()\[\],\.]', tokens.Punctuation),
+            (r'[<>=~!]+', tokens.Operator.Comparison),
+            (r'[+/@#%^&|`?^-]+', tokens.Operator),
         ],
         'multiline-comments': [
             (r'/\*', tokens.Comment.Multiline, 'multiline-comments'),
             (r'\*/', tokens.Comment.Multiline, '#pop'),
             (r'[^/\*]+', tokens.Comment.Multiline),
-            (r'[/*]', tokens.Comment.Multiline)
+            (r'[/*]', tokens.Comment.Multiline),
         ]}
 
     def __init__(self):
         self.filters = []
 
     def add_filter(self, filter_, **options):
-        from .filters import Filter
+        from sqlparse.filters import Filter
         if not isinstance(filter_, Filter):
             filter_ = filter_(**options)
         self.filters.append(filter_)
+
+    def _decode(self, text):
+        if sys.version_info[0] == 3:
+            if isinstance(text, str):
+                return text
+        if self.encoding == 'guess':
+            try:
+                text = text.decode('utf-8')
+                if text.startswith(u'\ufeff'):
+                    text = text[len(u'\ufeff'):]
+            except UnicodeDecodeError:
+                text = text.decode('latin1')
+        else:
+            try:
+                text = text.decode(self.encoding)
+            except UnicodeDecodeError:
+                text = text.decode('unicode-escape')
+
+        if self.tabsize > 0:
+            text = text.expandtabs(self.tabsize)
+        return text
 
     def get_tokens(self, text, unfiltered=False):
         """
@@ -222,24 +251,17 @@ class Lexer(object, metaclass=LexerMeta):
         Also preprocess the text, i.e. expand tabs and strip it if
         wanted and applies registered filters.
         """
-        if not isinstance(text, str):
-            if self.encoding == 'guess':
-                try:
-                    text = text.decode('utf-8')
-                    if text.startswith(u'\ufeff'):
-                        text = text[len(u'\ufeff'):]
-                except UnicodeDecodeError:
-                    text = text.decode('latin1')
+        if isinstance(text, basestring):
+            if self.stripall:
+                text = text.strip()
+            elif self.stripnl:
+                text = text.strip('\n')
+
+            if sys.version_info[0] < 3 and isinstance(text, unicode):
+                text = StringIO(text.encode('utf-8'))
+                self.encoding = 'utf-8'
             else:
-                text = text.decode(self.encoding)
-        if self.stripall:
-            text = text.strip()
-        elif self.stripnl:
-            text = text.strip('\n')
-        if self.tabsize > 0:
-            text = text.expandtabs(self.tabsize)
-#        if not text.endswith('\n'):
-#            text += '\n'
+                text = StringIO(text)
 
         def streamer():
             for i, t, v in self.get_tokens_unprocessed(text):
@@ -249,7 +271,7 @@ class Lexer(object, metaclass=LexerMeta):
             stream = apply_filters(stream, self.filters, self)
         return stream
 
-    def get_tokens_unprocessed(self, text, stack=('root',)):
+    def get_tokens_unprocessed(self, stream, stack=('root',)):
         """
         Split ``text`` into (tokentype, text) pairs.
 
@@ -260,6 +282,10 @@ class Lexer(object, metaclass=LexerMeta):
         statestack = list(stack)
         statetokens = tokendefs[statestack[-1]]
         known_names = {}
+
+        text = stream.read()
+        text = self._decode(text)
+
         while 1:
             for rexmatch, action, new_state in statetokens:
                 m = rexmatch(text, pos)
@@ -312,11 +338,13 @@ class Lexer(object, metaclass=LexerMeta):
                     break
 
 
-def tokenize(sql):
+def tokenize(sql, encoding=None):
     """Tokenize sql.
 
     Tokenize *sql* using the :class:`Lexer` and return a 2-tuple stream
     of ``(token type, value)`` items.
     """
     lexer = Lexer()
+    if encoding is not None:
+        lexer.encoding = encoding
     return lexer.get_tokens(sql)

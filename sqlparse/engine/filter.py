@@ -1,35 +1,27 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
-from ..sql import Statement, Token
-from .. import tokens as T
+
+from sqlparse.sql import Statement, Token
+from sqlparse import tokens as T
 
 
-class TokenFilter(object):
-
-    def __init__(self, **options):
-        self.options = options
-
-    def process(self, stack, stream):
-        """Process token stream."""
-        raise NotImplementedError
-
-
-class StatementFilter(TokenFilter):
+class StatementFilter:
+    "Filter that split stream at individual statements"
 
     def __init__(self):
-        TokenFilter.__init__(self)
         self._in_declare = False
         self._in_dbldollar = False
         self._is_create = False
         self._begin_depth = 0
 
     def _reset(self):
+        "Set the filter attributes to its default values"
         self._in_declare = False
         self._in_dbldollar = False
         self._is_create = False
         self._begin_depth = 0
 
     def _change_splitlevel(self, ttype, value):
+        "Get the new split level (increase, decrease or remain equal)"
         # PostgreSQL
         if (ttype == T.Name.Builtin
             and value.startswith('$') and value.endswith('$')):
@@ -54,8 +46,9 @@ class StatementFilter(TokenFilter):
 
         if unified == 'BEGIN':
             self._begin_depth += 1
-            if self._in_declare:  # FIXME(andi): This makes no sense.
-                return 0
+            if self._in_declare or self._is_create:
+                # FIXME(andi): This makes no sense.
+                return 1
             return 0
 
         if unified == 'END':
@@ -76,30 +69,41 @@ class StatementFilter(TokenFilter):
         return 0
 
     def process(self, stack, stream):
+        "Process the stream"
+        consume_ws = False
         splitlevel = 0
         stmt = None
-        consume_ws = False
         stmt_tokens = []
+
+        # Run over all stream tokens
         for ttype, value in stream:
-            # Before appending the token
-            if (consume_ws and ttype is not T.Whitespace
-                and ttype is not T.Comment.Single):
-                consume_ws = False
+            # Yield token if we finished a statement and there's no whitespaces
+            if consume_ws and ttype not in (T.Whitespace, T.Comment.Single):
                 stmt.tokens = stmt_tokens
                 yield stmt
+
+                # Reset filter and prepare to process next statement
                 self._reset()
-                stmt = None
+                consume_ws = False
                 splitlevel = 0
+                stmt = None
+
+            # Create a new statement if we are not currently in one of them
             if stmt is None:
                 stmt = Statement()
                 stmt_tokens = []
+
+            # Change current split level (increase, decrease or remain equal)
             splitlevel += self._change_splitlevel(ttype, value)
-            # Append the token
+
+            # Append the token to the current statement
             stmt_tokens.append(Token(ttype, value))
-            # After appending the token
-            if (splitlevel <= 0 and ttype is T.Punctuation
-                and value == ';'):
+
+            # Check if we get the end of a statement
+            if splitlevel <= 0 and ttype is T.Punctuation and value == ';':
                 consume_ws = True
+
+        # Yield pending statement (if any)
         if stmt is not None:
             stmt.tokens = stmt_tokens
             yield stmt

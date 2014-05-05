@@ -1,36 +1,23 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
-from __future__ import unicode_literals
 
 import re
 
 from os.path import abspath, join
 
-from . import sql
-from . import tokens as T
-from .engine import FilterStack
-from .tokens import (
-    Comment, Keyword, Name,
-    Punctuation, String, Whitespace,
-)
-
-
-class Filter(object):
-
-    def process(self, *args):
-        raise NotImplementedError
-
-
-class TokenFilter(Filter):
-
-    def process(self, stack, stream):
-        raise NotImplementedError
+from sqlparse import sql, tokens as T
+from sqlparse.engine import FilterStack
+from sqlparse.lexer import tokenize
+from sqlparse.pipeline import Pipeline
+from sqlparse.tokens import (Comment, Comparison, Keyword, Name, Punctuation,
+                             String, Whitespace)
+from sqlparse.utils import memoize_generator
+from sqlparse.utils import split_unquoted_newlines
 
 
 # --------------------------
 # token process
 
-class _CaseFilter(TokenFilter):
+class _CaseFilter:
 
     ttype = None
 
@@ -38,7 +25,7 @@ class _CaseFilter(TokenFilter):
         if case is None:
             case = 'upper'
         assert case in ['lower', 'upper', 'capitalize']
-        self.convert = getattr(str, case)
+        self.convert = getattr(unicode, case)
 
     def process(self, stack, stream):
         for ttype, value in stream:
@@ -61,7 +48,28 @@ class IdentifierCaseFilter(_CaseFilter):
             yield ttype, value
 
 
-class GetComments(Filter):
+class TruncateStringFilter:
+
+    def __init__(self, width, char):
+        self.width = max(width, 1)
+        self.char = unicode(char)
+
+    def process(self, stack, stream):
+        for ttype, value in stream:
+            if ttype is T.Literal.String.Single:
+                if value[:2] == '\'\'':
+                    inner = value[2:-2]
+                    quote = u'\'\''
+                else:
+                    inner = value[1:-1]
+                    quote = u'\''
+                if len(inner) > self.width:
+                    value = u''.join((quote, inner[:self.width], self.char,
+                                      quote))
+            yield ttype, value
+
+
+class GetComments:
     """Get the comments from a stack"""
     def process(self, stack, stream):
         for token_type, value in stream:
@@ -69,7 +77,7 @@ class GetComments(Filter):
                 yield token_type, value
 
 
-class StripComments(Filter):
+class StripComments:
     """Strip the comments from a stack"""
     def process(self, stack, stream):
         for token_type, value in stream:
@@ -77,15 +85,48 @@ class StripComments(Filter):
                 yield token_type, value
 
 
-class IncludeStatement(Filter):
+def StripWhitespace(stream):
+    "Strip the useless whitespaces from a stream leaving only the minimal ones"
+    last_type = None
+    has_space = False
+    ignore_group = frozenset((Comparison, Punctuation))
+
+    for token_type, value in stream:
+        # We got a previous token (not empty first ones)
+        if last_type:
+            if token_type in Whitespace:
+                has_space = True
+                continue
+
+        # Ignore first empty spaces and dot-commas
+        elif token_type in (Whitespace, Whitespace.Newline, ignore_group):
+            continue
+
+        # Yield a whitespace if it can't be ignored
+        if has_space:
+            if not ignore_group.intersection((last_type, token_type)):
+                yield Whitespace, ' '
+            has_space = False
+
+        # Yield the token and set its type for checking with the next one
+        yield token_type, value
+        last_type = token_type
+
+
+class IncludeStatement:
     """Filter that enable a INCLUDE statement"""
 
-    def __init__(self, dirpath=".", maxRecursive=10):
+    def __init__(self, dirpath=".", maxrecursive=10, raiseexceptions=False):
+        if maxrecursive <= 0:
+            raise ValueError('Max recursion limit reached')
+
         self.dirpath = abspath(dirpath)
-        self.maxRecursive = maxRecursive
+        self.maxRecursive = maxrecursive
+        self.raiseexceptions = raiseexceptions
 
         self.detected = False
 
+    @memoize_generator
     def process(self, stack, stream):
         # Run over all tokens in the stream
         for token_type, value in stream:
@@ -98,30 +139,48 @@ class IncludeStatement(Filter):
             elif self.detected:
                 # Omit whitespaces
                 if token_type in Whitespace:
-                    pass
+                    continue
 
-                # Get path of file to include
-                path = None
-
+                # Found file path to include
                 if token_type in String.Symbol:
 #                if token_type in tokens.String.Symbol:
+
+                    # Get path of file to include
                     path = join(self.dirpath, value[1:-1])
 
-                # Include file if path was found
-                if path:
                     try:
                         f = open(path)
                         raw_sql = f.read()
                         f.close()
-                    except IOError as err:
+
+                    # There was a problem loading the include file
+                    except IOError, err:
+                        # Raise the exception to the interpreter
+                        if self.raiseexceptions:
+                            raise
+
+                        # Put the exception as a comment on the SQL code
                         yield Comment, u'-- IOError: %s\n' % err
 
                     else:
                         # Create new FilterStack to parse readed file
                         # and add all its tokens to the main stack recursively
-                        # [ToDo] Add maximum recursive iteration value
+                        try:
+                            filtr = IncludeStatement(self.dirpath,
+                                                     self.maxRecursive - 1,
+                                                     self.raiseexceptions)
+
+                        # Max recursion limit reached
+                        except ValueError, err:
+                            # Raise the exception to the interpreter
+                            if self.raiseexceptions:
+                                raise
+
+                            # Put the exception as a comment on the SQL code
+                            yield Comment, u'-- ValueError: %s\n' % err
+
                         stack = FilterStack()
-                        stack.preprocess.append(IncludeStatement(self.dirpath))
+                        stack.preprocess.append(filtr)
 
                         for tv in stack.run(raw_sql):
                             yield tv
@@ -139,7 +198,7 @@ class IncludeStatement(Filter):
 # ----------------------
 # statement process
 
-class StripCommentsFilter(Filter):
+class StripCommentsFilter:
 
     def _get_next_comment(self, tlist):
         # TODO(andi) Comment types should be unified, see related issue38
@@ -170,7 +229,7 @@ class StripCommentsFilter(Filter):
         self._process(stmt)
 
 
-class StripWhitespaceFilter(Filter):
+class StripWhitespaceFilter:
 
     def _stripws(self, tlist):
         func_name = '_stripws_%s' % tlist.__class__.__name__.lower()
@@ -194,14 +253,15 @@ class StripWhitespaceFilter(Filter):
             tlist.tokens.pop(-2)
         self._stripws_default(tlist)
 
-    def process(self, stack, stmt):
-        [self.process(stack, sgroup) for sgroup in stmt.get_sublists()]
+    def process(self, stack, stmt, depth=0):
+        [self.process(stack, sgroup, depth + 1)
+         for sgroup in stmt.get_sublists()]
         self._stripws(stmt)
-        if stmt.tokens[-1].is_whitespace():
+        if depth == 0 and stmt.tokens[-1].is_whitespace():
             stmt.tokens.pop(-1)
 
 
-class ReindentFilter(Filter):
+class ReindentFilter:
 
     def __init__(self, width=2, char=' ', line_width=None):
         self.width = width
@@ -212,10 +272,17 @@ class ReindentFilter(Filter):
         self._curr_stmt = None
         self._last_stmt = None
 
+    def _flatten_up_to_token(self, token):
+        """Yields all tokens up to token plus the next one."""
+        # helper for _get_offset
+        iterator = self._curr_stmt.flatten()
+        for t in iterator:
+            yield t
+            if t == token:
+                raise StopIteration
+
     def _get_offset(self, token):
-        all_ = list(self._curr_stmt.flatten())
-        idx = all_.index(token)
-        raw = ''.join(str(x) for x in all_[:idx + 1])
+        raw = ''.join(map(unicode, self._flatten_up_to_token(token)))
         line = raw.splitlines()[-1]
         # Now take current offset into account and return relative offset.
         full_offset = len(line) - len(self.char * (self.width * self.indent))
@@ -223,13 +290,19 @@ class ReindentFilter(Filter):
 
     def nl(self):
         # TODO: newline character should be configurable
-        ws = '\n' + (self.char * ((self.indent * self.width) + self.offset))
+        space = (self.char * ((self.indent * self.width) + self.offset))
+        # Detect runaway indenting due to parsing errors
+        if len(space) > 200:
+            # something seems to be wrong, flip back
+            self.indent = self.offset = 0
+            space = (self.char * ((self.indent * self.width) + self.offset))
+        ws = '\n' + space
         return sql.Token(T.Whitespace, ws)
 
     def _split_kwds(self, tlist):
-        split_words = ('FROM', 'JOIN$', 'AND', 'OR',
+        split_words = ('FROM', 'STRAIGHT_JOIN$', 'JOIN$', 'AND', 'OR',
                        'GROUP', 'ORDER', 'UNION', 'VALUES',
-                       'SET', 'BETWEEN')
+                       'SET', 'BETWEEN', 'EXCEPT')
 
         def _next_token(i):
             t = tlist.token_next_match(i, T.Keyword, split_words,
@@ -250,8 +323,8 @@ class ReindentFilter(Filter):
                 offset += 1
             if (prev
                 and isinstance(prev, sql.Comment)
-                and (str(prev).endswith('\n')
-                     or str(prev).endswith('\r'))):
+                and (unicode(prev).endswith('\n')
+                     or unicode(prev).endswith('\r'))):
                 nl = tlist.token_next(token)
             else:
                 nl = self.nl()
@@ -291,8 +364,8 @@ class ReindentFilter(Filter):
             self.indent += 1
             tlist.tokens.insert(0, self.nl())
             indented = True
-        num_offset = self._get_offset(tlist.token_next_match(0,
-                                                        T.Punctuation, '('))
+        num_offset = self._get_offset(
+            tlist.token_next_match(0, T.Punctuation, '('))
         self.offset += num_offset
         self._process_default(tlist, stmts=not indented)
         if indented:
@@ -300,13 +373,16 @@ class ReindentFilter(Filter):
         self.offset -= num_offset
 
     def _process_identifierlist(self, tlist):
-        identifiers = tlist.get_identifiers()
+        identifiers = list(tlist.get_identifiers())
         if len(identifiers) > 1 and not tlist.within(sql.Function):
             first = list(identifiers[0].flatten())[0]
             num_offset = self._get_offset(first) - len(first.value)
             self.offset += num_offset
             for token in identifiers[1:]:
                 tlist.insert_before(token, self.nl())
+            for token in tlist.tokens:
+                if isinstance(token, sql.Comment):
+                    tlist.insert_after(token, self.nl())
             self.offset -= num_offset
         self._process_default(tlist)
 
@@ -352,21 +428,21 @@ class ReindentFilter(Filter):
         self._process(stmt)
         if isinstance(stmt, sql.Statement):
             if self._last_stmt is not None:
-                if self._last_stmt.to_unicode().endswith('\n'):
+                if unicode(self._last_stmt).endswith('\n'):
                     nl = '\n'
                 else:
                     nl = '\n\n'
-                stmt.tokens.insert(0,
-                    sql.Token(T.Whitespace, nl))
+                stmt.tokens.insert(
+                    0, sql.Token(T.Whitespace, nl))
             if self._last_stmt != stmt:
                 self._last_stmt = stmt
 
 
 # FIXME: Doesn't work ;)
-class RightMarginFilter(Filter):
+class RightMarginFilter:
 
     keep_together = (
-#        sql.TypeCast, sql.Identifier, sql.Alias,
+        # sql.TypeCast, sql.Identifier, sql.Alias,
     )
 
     def __init__(self, width=79):
@@ -384,7 +460,7 @@ class RightMarginFilter(Filter):
                   and not token.__class__ in self.keep_together):
                 token.tokens = self._process(stack, token, token.tokens)
             else:
-                val = token.to_unicode()
+                val = unicode(token)
                 if len(self.line) + len(val) > self.width:
                     match = re.search('^ +', self.line)
                     if match is not None:
@@ -401,7 +477,7 @@ class RightMarginFilter(Filter):
         group.tokens = self._process(stack, group, group.tokens)
 
 
-class ColumnsSelect(Filter):
+class ColumnsSelect:
     """Get the columns names of a SELECT query"""
     def process(self, stack, stream):
         mode = 0
@@ -455,33 +531,50 @@ class ColumnsSelect(Filter):
 # ---------------------------
 # postprocess
 
-class SerializerUnicode(Filter):
+class SerializerUnicode:
 
     def process(self, stack, stmt):
-        raw = stmt.to_unicode()
-        add_nl = raw.endswith('\n')
-        res = '\n'.join(line.rstrip() for line in raw.splitlines())
-        if add_nl:
-            res += '\n'
+        raw = unicode(stmt)
+        lines = split_unquoted_newlines(raw)
+        res = '\n'.join(line.rstrip() for line in lines)
         return res
+
 
 def Tokens2Unicode(stream):
     result = ""
 
     for _, value in stream:
-        result += str(value)
+        result += unicode(value)
 
     return result
 
 
-class OutputPythonFilter(Filter):
+class OutputFilter:
+    varname_prefix = ''
 
     def __init__(self, varname='sql'):
-        self.varname = varname
-        self.cnt = 0
+        self.varname = self.varname_prefix + varname
+        self.count = 0
 
-    def _process(self, stream, varname, count, has_nl):
-        if count > 1:
+    def _process(self, stream, varname, has_nl):
+        raise NotImplementedError
+
+    def process(self, stack, stmt):
+        self.count += 1
+        if self.count > 1:
+            varname = '%s%d' % (self.varname, self.count)
+        else:
+            varname = self.varname
+
+        has_nl = len(unicode(stmt).strip().splitlines()) > 1
+        stmt.tokens = self._process(stmt.tokens, varname, has_nl)
+        return stmt
+
+
+class OutputPythonFilter(OutputFilter):
+    def _process(self, stream, varname, has_nl):
+        # SQL query asignation to varname
+        if self.count > 1:
             yield sql.Token(T.Whitespace, '\n')
         yield sql.Token(T.Name, varname)
         yield sql.Token(T.Whitespace, ' ')
@@ -490,85 +583,87 @@ class OutputPythonFilter(Filter):
         if has_nl:
             yield sql.Token(T.Operator, '(')
         yield sql.Token(T.Text, "'")
-        cnt = 0
+
+        # Print the tokens on the quote
         for token in stream:
-            cnt += 1
+            # Token is a new line separator
             if token.is_whitespace() and '\n' in token.value:
-                if cnt == 1:
-                    continue
-                after_lb = token.value.split('\n', 1)[1]
+                # Close quote and add a new line
                 yield sql.Token(T.Text, " '")
                 yield sql.Token(T.Whitespace, '\n')
-                for i in range(len(varname) + 4):
-                    yield sql.Token(T.Whitespace, ' ')
+
+                # Quote header on secondary lines
+                yield sql.Token(T.Whitespace, ' ' * (len(varname) + 4))
                 yield sql.Token(T.Text, "'")
-                if after_lb:  # it's the indendation
+
+                # Indentation
+                after_lb = token.value.split('\n', 1)[1]
+                if after_lb:
                     yield sql.Token(T.Whitespace, after_lb)
                 continue
-            elif token.value and "'" in token.value:
+
+            # Token has escape chars
+            elif "'" in token.value:
                 token.value = token.value.replace("'", "\\'")
-            yield sql.Token(T.Text, token.value or '')
+
+            # Put the token
+            yield sql.Token(T.Text, token.value)
+
+        # Close quote
         yield sql.Token(T.Text, "'")
         if has_nl:
             yield sql.Token(T.Operator, ')')
 
-    def process(self, stack, stmt):
-        self.cnt += 1
-        if self.cnt > 1:
-            varname = '%s%d' % (self.varname, self.cnt)
-        else:
-            varname = self.varname
-        has_nl = len(stmt.to_unicode().strip().splitlines()) > 1
-        stmt.tokens = self._process(stmt.tokens, varname, self.cnt, has_nl)
-        return stmt
 
+class OutputPHPFilter(OutputFilter):
+    varname_prefix = '$'
 
-class OutputPHPFilter(Filter):
-
-    def __init__(self, varname='sql'):
-        self.varname = '$%s' % varname
-        self.count = 0
-
-    def _process(self, stream, varname):
+    def _process(self, stream, varname, has_nl):
+        # SQL query asignation to varname (quote header)
         if self.count > 1:
             yield sql.Token(T.Whitespace, '\n')
         yield sql.Token(T.Name, varname)
         yield sql.Token(T.Whitespace, ' ')
+        if has_nl:
+            yield sql.Token(T.Whitespace, ' ')
         yield sql.Token(T.Operator, '=')
         yield sql.Token(T.Whitespace, ' ')
         yield sql.Token(T.Text, '"')
+
+        # Print the tokens on the quote
         for token in stream:
+            # Token is a new line separator
             if token.is_whitespace() and '\n' in token.value:
-                after_lb = token.value.split('\n', 1)[1]
-                yield sql.Token(T.Text, ' "')
-                yield sql.Token(T.Operator, ';')
+                # Close quote and add a new line
+                yield sql.Token(T.Text, ' ";')
                 yield sql.Token(T.Whitespace, '\n')
+
+                # Quote header on secondary lines
                 yield sql.Token(T.Name, varname)
                 yield sql.Token(T.Whitespace, ' ')
-                yield sql.Token(T.Punctuation, '.')
-                yield sql.Token(T.Operator, '=')
+                yield sql.Token(T.Operator, '.=')
                 yield sql.Token(T.Whitespace, ' ')
                 yield sql.Token(T.Text, '"')
+
+                # Indentation
+                after_lb = token.value.split('\n', 1)[1]
                 if after_lb:
-                    yield sql.Token(T.Text, after_lb)
+                    yield sql.Token(T.Whitespace, after_lb)
                 continue
+
+            # Token has escape chars
             elif '"' in token.value:
                 token.value = token.value.replace('"', '\\"')
+
+            # Put the token
             yield sql.Token(T.Text, token.value)
+
+        # Close quote
         yield sql.Token(T.Text, '"')
         yield sql.Token(T.Punctuation, ';')
 
-    def process(self, stack, stmt):
-        self.count += 1
-        if self.count > 1:
-            varname = '%s%d' % (self.varname, self.count)
-        else:
-            varname = self.varname
-        stmt.tokens = tuple(self._process(stmt.tokens, varname))
-        return stmt
 
-
-class Limit(Filter):
+class Limit:
     """Get the LIMIT of a query.
 
     If not defined, return -1 (SQL specification for no LIMIT query)
@@ -587,3 +682,13 @@ class Limit(Filter):
                 return stream[4 - index][1]
 
         return -1
+
+
+def compact(stream):
+    """Function that return a compacted version of the stream"""
+    pipe = Pipeline()
+
+    pipe.append(StripComments())
+    pipe.append(StripWhitespace)
+
+    return pipe(stream)
